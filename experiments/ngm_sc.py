@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 sys.path.append("../../")
 sys.path.append("../")
 import os
+import ot
 import NMC as models
 import importlib
 import os
@@ -210,6 +211,8 @@ def train_sequential_discrete_time_ode(
     plot_freq=1000,
     l1_reg=0.0,
     l2_reg=0.05,
+    alpha_wass=0.0,
+    reg=1e-2,
     plot=True,
     device="cpu"
 ):
@@ -277,6 +280,18 @@ def train_sequential_discrete_time_ode(
         v = F.normalize(wadj, dim=1) * alpha[:, None, :]
         w.data = v.view(-1, func.dims[0])
 
+    def wasserstein_loss(x_pred, x_true, reg=1e-2):
+        if alpha_wass <= 0.0:
+            return torch.tensor(0.0, device=x_pred.device)
+        X_pred = x_pred.detach().cpu().numpy()
+        X_true = x_true.detach().cpu().numpy()
+        a = ot.unif(X_pred.shape[0])
+        b = ot.unif(X_true.shape[0])
+        M = np.sum((X_pred[:,None,:] - X_true[None,:,:])**2, axis=2)
+        pi = ot.sinkhorn(a, b, M, reg=reg)
+        dist = (pi * M).sum()
+        return torch.tensor(dist, device=x_pred.device, dtype=torch.float32)
+
     # Initialize optimizer
     lr = 0.005
     optimizer = torch.optim.Adam(func.parameters(), lr=lr)
@@ -307,19 +322,16 @@ def train_sequential_discrete_time_ode(
         # Compute loss (MSE between predicted and true x1)
         loss = F.mse_loss(z_pred, x1)
 
-        # add regularization on A(t)
-        A_t = func.dynamic_a(t[-1])  # Extract A(t) at the final time of the batch
-        l1_penalty = 0.01 * torch.sum(torch.abs(A_t))
-
-        loss += l1_penalty
-
         # Add regularization - only for regular MLPODEF
-        # if l2_reg != 0:
-        #     l2 = func.l2_reg()
-        #     loss += l2_reg * l2
-        # if l1_reg != 0:
-        #     l1 = func.fc1_reg()
-        #     loss += l1_reg * l1
+        if l2_reg != 0:
+            l2 = func.l2_reg()
+            loss += l2_reg * l2
+        if l1_reg != 0:
+            l1 = func.fc1_reg()
+            loss += l1_reg * l1
+
+        w_loss = wasserstein_loss(z_pred, x1, reg=reg)
+        loss += alpha_wass * w_loss
 
         # Backward pass and optimization
         optimizer.zero_grad()
@@ -327,7 +339,7 @@ def train_sequential_discrete_time_ode(
         optimizer.step()
 
         # Apply proximal operator to fc1.weight - only for regular MLPODEF
-        #proximal(func.fc1.weight, lam=func.GL_reg, eta=0.01)
+        proximal(func.fc1.weight, lam=func.GL_reg, eta=0.01)
 
         # alternative proximal operator for dynamic A
         # apply_proximal_operator()
@@ -407,7 +419,7 @@ def main():
     hidden_dim = 500
     dims = [num_variables, hidden_dim, 1]  # Example: [8, 500, 1]
     #func = models.MLPODEF(dims=dims, GL_reg=0.09)
-    func = DynamicAODEFunc(num_variables, hidden_dim)
+    func = DynamicAODEFunc(num_variables, hidden_dim).to("cuda")
 
     # Prepare your data tensor
     # Assuming you have loaded your data into 'adata' as a single AnnData object
