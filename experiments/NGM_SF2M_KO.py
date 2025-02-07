@@ -24,7 +24,7 @@ from src import util
 from sf2m_utils import SDE, torch_wrapper, wasserstein
 from plot_utils import *
 
-T = 5
+T = 10
 class DataLoader:
     def __init__(self, data_path, dataset_type="Synthetic"):
         """
@@ -44,8 +44,8 @@ class DataLoader:
         """Load and preprocess data"""
         if self.dataset_type == "Synthetic":
             paths = glob.glob(
-                os.path.join(self.data_path, "dyn-TF/dyn-TF*-1")
-            ) + glob.glob(os.path.join(self.data_path, "dyn-TF_ko*/dyn-TF*-1"))
+                os.path.join(self.data_path, "dyn-LI/dyn-LI*-1")
+            ) + glob.glob(os.path.join(self.data_path, "dyn-LI_ko*/dyn-LI*-1"))
         elif self.dataset_type == "Curated":
             paths = glob.glob(os.path.join(self.data_path, f"HSC*/HSC*-1"))
         else:
@@ -192,8 +192,8 @@ def build_knockout_mask(d, ko_idx):
         # Zero row g => remove outgoing edges from gene g
         #mask[g, :] = 0.0
         # Zero column g => remove incoming edges to gene g
-        mask[:, g] = 0.0
-        mask[g, g] = 1.0
+        mask[:, 2] = 0.0
+        mask[2, 2] = 1.0
         return mask
 
 
@@ -207,11 +207,11 @@ def compute_pi_entropic_fixed(x0, x1, reg=1e-2, numItermax=10000, ko_index=None,
     b = ot.unif(x1_np.shape[0])  # uniform distribution over columns
     # Cost matrix: squared Euclidean distance
     M = np.sum((x0_np[:, None, :] - x1_np[None, :, :])**2, axis=2)
-    if ko_index is not None:
-        ko0 = (x0_np[:, ko_index] < 1)
-        ko1 = (x1_np[:, ko_index] < 1)
-        mismatch = (ko0[:,None] != ko1[None, :])
-        M[mismatch] = cost
+    # if ko_index is not None:
+    #     ko0 = (x0_np[:, ko_index] < 1)
+    #     ko1 = (x1_np[:, ko_index] < 1)
+    #     mismatch = (ko0[:,None] != ko1[None, :])
+    #     M[mismatch] = cost
     pi = ot.sinkhorn(a, b, M, reg=reg, numItermax=numItermax)
     return pi
 
@@ -471,7 +471,7 @@ def simulate_trajectory(flow_model, score_model, x0, t_span, num_steps, sigma=0.
         # Create a time tensor for each sample.
         t_batch = torch.full((x.shape[0],), t.item(), device=x.device)
         flow = flow_model(t_batch, x.unsqueeze(1)).squeeze(1)
-        score = score_model(t_batch, x)
+        score = score_model(t_batch, x, )
         # Use the drift formulation: flow - (sigma^2 / 2) * score.
         return flow - (sigma**2 / 2) * score
 
@@ -509,6 +509,9 @@ def simulate_trajectory(flow_model, score_model, x0, t_span, num_steps, sigma=0.
 def train_and_evaluate_with_holdout(adatas,
                                     held_out_time,
                                     num_variables,
+                                    kos, 
+                                    ko_indices,
+                                    true_matrix,
                                     hidden_dim=200,
                                     n_steps=5000,
                                     device="cuda" if torch.cuda.is_available() else "cpu"):
@@ -531,75 +534,6 @@ def train_and_evaluate_with_holdout(adatas,
         flow_model: Trained flow model.
         score_model: Trained score model.
     """
-    dims = [num_variables, hidden_dim, 1]
-    func_v = models.MLPODEF(dims=dims, GL_reg=0.015, bias=True)
-    score_net = MLP(d=num_variables, hidden_sizes=[hidden_dim], time_varying=True, conditional=True, conditional_dim=1)
-
-    # Filter out data from held_out_time.
-    filtered_adatas = []
-    for adata in adatas:
-        mask = adata.obs["t"] != held_out_time
-        filtered_adata = adata[mask].copy()
-        filtered_adatas.append(filtered_adata)
-
-    # Compute pis for filtered datasets.
-    all_pis_list = []
-    for adata in filtered_adatas:
-        pis = compute_all_pis_fixed(adata, adata.obs["t"].max(), reg=1e-1)
-        all_pis_list.append(pis)
-
-    # Train the model.
-    loss_history, flow_model, score_model = train_with_fmot_scorematching(
-        func_v=func_v,
-        func_s=score_net,
-        adatas_list=filtered_adatas,
-        all_pis_list=all_pis_list,
-        t=filtered_adatas[0].obs["t"].max(),
-        sigma=0.1,
-        dt=1.0,
-        alpha=0.05,
-        reg=1e-6,
-        n_steps=n_steps,
-        batch_size=164,
-        device=device,
-        lr=3e-3,
-    )
-
-    # Evaluate on held-out timepoint.
-    distances = []
-    for adata in adatas:
-        x0 = torch.from_numpy(adata.X[adata.obs["t"] == held_out_time - 1]).float()
-        true_dist = torch.from_numpy(adata.X[adata.obs["t"] == held_out_time]).float()
-
-        if len(x0) == 0 or len(true_dist) == 0:
-            continue
-
-        traj_ode = simulate_trajectory(flow_model, score_model, x0, t_span=(0.0, 1.0), num_steps=2, use_sde=False)
-        traj_sde = simulate_trajectory(flow_model, score_model, x0, t_span=(0.0, 1.0), num_steps=2, use_sde=True)
-
-        w_dist_ode = wasserstein(traj_ode[-1], true_dist)
-        w_dist_sde = wasserstein(traj_sde[-1], true_dist)
-
-        distances.append({"ode": w_dist_ode, "sde": w_dist_sde})
-
-    avg_distances = {
-        "ode": np.mean([d["ode"] for d in distances]),
-        "sde": np.mean([d["sde"] for d in distances]),
-    }
-
-    return avg_distances, flow_model, score_model
-
-
-def main():
-    T = 5
-    data_loader = DataLoader("../../data/simulation", dataset_type="Synthetic")
-    data_loader.load_data()
-    adatas, kos, ko_indices, true_matrix = (
-        data_loader.adatas,
-        data_loader.kos,
-        data_loader.ko_indices,
-        data_loader.true_matrix.values,
-    )
     batch_size = 164
 
     # want to create a [8, n, 8] matrix that is one hot encoded and will be selected depending on dataset idx
@@ -653,8 +587,96 @@ def main():
         true_mat = true_matrix
     )
 
+    # Evaluate on held-out timepoint.
+    distances = []
+    for adata in adatas:
+        x0 = torch.from_numpy(adata.X[adata.obs["t"] == held_out_time - 1]).float()
+        true_dist = torch.from_numpy(adata.X[adata.obs["t"] == held_out_time]).float()
+
+        if len(x0) == 0 or len(true_dist) == 0:
+            continue
+
+        traj_ode = simulate_trajectory(flow_model, score_model, x0, t_span=(0.0, 1.0), num_steps=2, use_sde=False)
+        traj_sde = simulate_trajectory(flow_model, score_model, x0, t_span=(0.0, 1.0), num_steps=2, use_sde=True)
+
+        w_dist_ode = wasserstein(traj_ode[-1], true_dist)
+        w_dist_sde = wasserstein(traj_sde[-1], true_dist)
+
+        distances.append({"ode": w_dist_ode, "sde": w_dist_sde})
+
+    avg_distances = {
+        "ode": np.mean([d["ode"] for d in distances]),
+        "sde": np.mean([d["sde"] for d in distances]),
+    }
+
+    return avg_distances, flow_model, score_model
+
+
+def main():
+    T = 5
+    data_loader = DataLoader("../../data/simulation", dataset_type="Synthetic")
+    data_loader.load_data()
+    adatas, kos, ko_indices, true_matrix = (
+        data_loader.adatas,
+        data_loader.kos,
+        data_loader.ko_indices,
+        data_loader.true_matrix.values,
+    )
+    batch_size = 164
+
+    # want to create a [8, n, 8] matrix that is one hot encoded and will be selected depending on dataset idx
+    conditionals = []
+    for i, ad in enumerate(kos):
+        cond_matrix = torch.zeros(batch_size, 7)
+        if ad is not None:
+            cond_matrix[:,i] = 1
+        conditionals.append(cond_matrix)
+   
+    knockout_masks = []
+    for i, ad in enumerate(adatas):
+        d = ad.X.shape[1]
+        mask_i = build_knockout_mask(d, ko_indices[i])  # returns [d,d]
+        knockout_masks.append(mask_i)
+
+    wt_idx = [i for i, ko in enumerate(kos) if ko is None]
+    ko_idx = [i for i, ko in enumerate(kos) if ko is not None]
+    adatas_wt = [adatas[i] for i in wt_idx]
+    adatas_ko = [adatas[i] for i in ko_idx]
+    num_variables = 7
+    hidden_dim = 200
+    dims = [num_variables, hidden_dim, 1]
+    t = adatas[0].obs["t"].max()
+
+    func_v = models.MLPODEF(dims=dims, GL_reg=0.01, bias=True, knockout_masks=knockout_masks)
+    score_net = MLP(d=num_variables, hidden_sizes=[hidden_dim], time_varying=True, conditional=True, conditional_dim=7)
+
+    # Compute pis for all datasets
+    all_pis_list = []
+    for i, ad in enumerate(zip(adatas, ko_indices)):
+        T_local = ad[0].obs["t"].max()
+        pi_list = compute_all_pis_fixed(ad[0], T_local, reg=1e-1, ko_index=ad[1])
+        all_pis_list.append(pi_list)
+
+    loss_history, flow_model, score_model = train_with_fmot_scorematching(
+        func_v=func_v,
+        func_s=score_net,
+        adatas_list=adatas_wt,  
+        all_pis_list=all_pis_list,
+        t=t,
+        cond_matrix=conditionals,
+        sigma=0.1,
+        dt=1.0,
+        alpha=0.05,
+        reg=1e-6,
+        n_steps=60000,
+        batch_size=batch_size,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        lr=6e-3,
+        true_mat = true_matrix
+    )
+
     # Rest of the visualization code remains the same
-    graph_sm = flow_model.causal_graph() * (1 - np.eye(8))
+    graph_sm = flow_model.causal_graph() * (1 - np.eye(7))
 
     plt.figure(figsize=(8, 6))
     plt.matshow(graph_sm, cmap="Reds", fignum=False)
@@ -662,6 +684,15 @@ def main():
     plt.colorbar()
     plt.title("Learned graph")
     plt.show()
+
+    plt.figure(figsize=(8, 6))
+    plt.matshow(true_matrix, cmap="RdBu_r", fignum=False)
+    plt.gca().invert_yaxis()
+    plt.colorbar()
+    plt.title("Learned graph")
+    plt.show()
+
+
 
     plt.figure(figsize=(8, 6))
     y_true = np.abs(np.sign(true_matrix).astype(int).flatten())
@@ -730,7 +761,7 @@ def main_with_holdout():
     Run leave-one-out evaluation for the linear model.
     """
     T = 5
-    data_loader = DataLoader("data/simulation", dataset_type="Synthetic")
+    data_loader = DataLoader("../../data/simulation", dataset_type="Synthetic")
     data_loader.load_data()
     adatas, kos, ko_indices, true_matrix = (
         data_loader.adatas,
@@ -746,7 +777,7 @@ def main_with_holdout():
         print(f"\n=== Training with timepoint {held_out_time} held out ===")
 
         avg_distances, flow_model, score_model = train_and_evaluate_with_holdout(
-            adatas=adatas, held_out_time=held_out_time, num_variables=num_variables
+            adatas=adatas, held_out_time=held_out_time, num_variables=num_variables, kos=kos, ko_indices=ko_indices, true_matrix=true_matrix
         )
 
         results.append({"held_out_time": held_out_time, "distances": avg_distances})
@@ -759,5 +790,5 @@ def main_with_holdout():
 
 
 if __name__ == "__main__":
-    # main_with_holdout()
+    #main_with_holdout()
     main()
