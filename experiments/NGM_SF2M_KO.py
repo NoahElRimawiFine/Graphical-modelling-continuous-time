@@ -668,7 +668,7 @@ def main():
         dt=1.0,
         alpha=0.05,
         reg=1e-6,
-        n_steps=60000,
+        n_steps=100000,
         batch_size=batch_size,
         device="cuda" if torch.cuda.is_available() else "cpu",
         lr=6e-3,
@@ -727,19 +727,16 @@ def main():
         for i, adata in enumerate(adatas_list):
             ds_idx = dataset_idxs[i] if dataset_idxs is not None else None
             print(f"Evaluating dataset {i} (dataset_idx = {ds_idx})")
-            # We assume adata.obs["t"] is available and gives time bins.
             time_bins = np.unique(adata.obs["t"].values).astype(int)
             ds_metrics = []
             for tb in time_bins[:-1]:
-                # Instead of plotting interactively, you can have your function return metrics.
                 mse_val, corr_val, r2_val, wass_val = plot_predicted_vs_true_with_metrics(
                     func_v=func, adata=adata, start_bin=tb, end_bin=tb+1, n_samples=n_samples, device=device
                 )
                 ds_metrics.append((tb, mse_val, corr_val, r2_val, wass_val))
             results[i] = ds_metrics
         return results
-
-    # Example usage (if you have defined dataset_idxs such that KO datasets have indices 0,...,6 and wt is index 7, for instance):
+    
     results = evaluate_all_datasets(
         func=flow_model, 
         adatas_list=adatas, 
@@ -748,7 +745,6 @@ def main():
         dataset_idxs=list(range(len(adatas)))
     )
 
-    # Now you can aggregate metrics, for example:
     all_mse = []
     for ds, metrics in results.items():
         for (tb, mse_val, corr_val, r2_val, wass_val) in metrics:
