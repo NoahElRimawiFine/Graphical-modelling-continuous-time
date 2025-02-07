@@ -675,7 +675,6 @@ def main():
         true_mat = true_matrix
     )
 
-    # Rest of the visualization code remains the same
     graph_sm = flow_model.causal_graph() * (1 - np.eye(7))
 
     plt.figure(figsize=(8, 6))
