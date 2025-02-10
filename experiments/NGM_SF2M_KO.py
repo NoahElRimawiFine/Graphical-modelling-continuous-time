@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import sys
 sys.path.append("../../")
-sys.path.append("../")
 import matplotlib.pyplot as plt
 import NMC as models
 import importlib
@@ -23,8 +22,9 @@ import torchsde
 from src import util
 from sf2m_utils import SDE, torch_wrapper, wasserstein
 from plot_utils import *
+import fm
 
-T = 10
+T = 8
 class DataLoader:
     def __init__(self, data_path, dataset_type="Synthetic"):
         """
@@ -192,9 +192,29 @@ def build_knockout_mask(d, ko_idx):
         # Zero row g => remove outgoing edges from gene g
         #mask[g, :] = 0.0
         # Zero column g => remove incoming edges to gene g
-        mask[:, 2] = 0.0
-        mask[2, 2] = 1.0
+        mask[:, g] = 0.0
+        mask[g, g] = 1.0
         return mask
+    
+def build_entropic_otfms(adatas, T, sigma, dt):
+    """
+    Returns a list of EntropicOTFM objects, one per dataset.
+    """
+    otfms = []
+    for adata in adatas:
+        x_tensor = torch.tensor(adata.X, dtype=torch.float32)
+        t_idx = torch.tensor(adata.obs["t"], dtype=torch.long)
+        model = fm.EntropicOTFM(
+            x=x_tensor,
+            t_idx=t_idx,
+            dt=dt,
+            sigma=sigma,
+            T=T,
+            dim=x_tensor.shape[1],
+            device=torch.device("cpu")
+        )
+        otfms.append(model)
+    return otfms
 
 
 def compute_pi_entropic_fixed(x0, x1, reg=1e-2, numItermax=10000, ko_index=None, cost=1e9):
@@ -307,11 +327,8 @@ def train_with_fmot_scorematching(
     func_v,
     func_s,
     adatas_list,
-    all_pis_list,  
-    t,
-    cond_matrix=None,
-    sigma=0.1,
-    dt=1.0,
+    otfms,
+    cond_matrix,
     alpha=0.5,
     reg=1e-5,
     n_steps=2000,
@@ -325,7 +342,7 @@ def train_with_fmot_scorematching(
     """
     func_v.to(device)
     func_s.to(device)
-    optimizer = torch.optim.AdamW(
+    optim = torch.optim.AdamW(
         list(func_v.parameters()) + list(func_s.parameters()), lr=lr
     )
 
@@ -334,7 +351,7 @@ def train_with_fmot_scorematching(
     save_dir = "training_visuals"
     os.makedirs(save_dir, exist_ok=True)
 
-    def proximal(w, dims, lam=0.1, eta=0.01):
+    def proximal(w, dims, lam=0.1, eta=0.1):
         with torch.no_grad():
             d = dims[0]
             d_hidden = dims[1]
@@ -344,61 +361,44 @@ def train_with_fmot_scorematching(
             v_ = F.normalize(wadj, dim=1) * alpha_[:, None, :]
             w.copy_(v_.view(-1, d))
 
-    for step in tqdm(range(n_steps)):
-        # Randomly select a dataset
-        dataset_idx = np.random.randint(0, len(adatas_list))
-        adata = adatas_list[dataset_idx]
-        pis = all_pis_list[dataset_idx]
+    for i in tqdm(range(n_steps)):
+        ds_idx = np.random.randint(0, len(adatas_list))
+        model = otfms[ds_idx]
 
-        # Randomly select a time bin
-        tb = np.random.randint(0, t)
+        _x, _s, _u, _t, _t_orig = model.sample_bridges_flows(batch_size=batch_size)
+        optim.zero_grad()
 
-        pi_matrix = pis[tb]
-        if pi_matrix is None:
-            continue
+        # Reshape inputs for MLPODEF
+        s_input = _x.unsqueeze(1)
+        v_input = _x.unsqueeze(1)
+        t_input = _t.unsqueeze(1)
 
-        cells_t0 = adata.X[(adata.obs["t"] == tb).values, :]
-        cells_t1 = adata.X[(adata.obs["t"] == tb + 1).values, :]
-        n0, n1 = cells_t0.shape[0], cells_t1.shape[0]
-        if n0 == 0 or n1 == 0:
-            continue
+        # Get model outputs and reshape
+        s_fit = func_s(_t, _x).squeeze(1)
+        # v_fit = v(t_input, v_input).squeeze(1)
+        v_fit = func_v(t_input, v_input).squeeze(1) - model.sigma**2/2 * func_s(_t, _x)
 
-        x0, x1 = sample_plan(cells_t0, cells_t1, pi_matrix, batch_size, device=device)
+        L_score = torch.mean((_t_orig * (1 - _t_orig)) * (s_fit - _s) ** 2)
+        L_flow = torch.mean((v_fit * model.dt - _u) ** 2)
 
-        tau = torch.rand(batch_size, 1, device=device)
-        x_tau, s_true, u = brownian_bridge(x0, x1, tau, sigma=sigma)
+        L_reg = func_v.l2_reg() + func_v.fc1_reg()
+        if i < 100: # train score for first few iters 
+            L = alpha * L_score
+        else:
+            L = alpha * L_score + (1 - alpha) * L_flow + reg * L_reg
 
-        s_input = x_tau
-        B = s_input.shape[0]
-        t_tensor = torch.full((B,), float(tb), device=device)
+        with torch.no_grad():
+            if i % 100 == 0:
+                print(L_score.item(), L_flow.item(), L_reg.item())
+            loss_history.append(L.item())
 
-        s_pred = func_s(t_tensor, s_input, cond_matrix[dataset_idx])
-
-        v_input = x_tau.unsqueeze(1)
-        # v_pred = func_v(tb, v_input).squeeze(1)
-        v_pred = func_v(tb, v_input, dataset_idx).squeeze(1) - sigma**2 / 2 * func_s(t_tensor, s_input, cond_matrix[dataset_idx])
-
-        weight_ = tau * (1 - tau)
-        L_score = torch.mean(weight_ * (s_pred - s_true) ** 2)
-        L_flow = torch.mean((v_pred * dt - u) ** 2)
-
-        L_reg = 0.0
-        if hasattr(func_v, "l2_reg"):
-            L_reg += func_v.l2_reg()
-        if hasattr(func_v, "fc1_reg"):
-            L_reg += func_v.fc1_reg()
-
-        L = alpha * L_score + (1 - alpha) * L_flow + reg * L_reg
-
-        optimizer.zero_grad()
         L.backward()
-        optimizer.step()
+        optim.step()
 
-        if hasattr(func_v, "fc1") and hasattr(func_v, "dims"):
-            proximal(func_v.fc1.weight, func_v.dims, lam=func_v.GL_reg, eta=0.01)
+        # proximal(s.fc1.weight, s.dims, lam=s.GL_reg, eta=0.01)
+        proximal(func_v.fc1.weight, func_v.dims, lam=func_v.GL_reg, eta=0.01)
 
-        loss_history.append(L.item())
-        if step % 1000 == 0:
+        if i % 1000 == 0:
             with torch.no_grad():
                 graph_sm = func_v.causal_graph()
 
@@ -408,7 +408,7 @@ def train_with_fmot_scorematching(
                 plt.gca().invert_yaxis()
                 plt.colorbar()
                 plt.title("Learned graph")
-                graph_path = os.path.join(save_dir, f"learned_graph_step_{step}.png")
+                graph_path = os.path.join(save_dir, f"learned_graph_step_{i}.png")
                 plt.savefig(graph_path, dpi=300, bbox_inches="tight")
                 plt.close()
 
@@ -426,12 +426,12 @@ def train_with_fmot_scorematching(
                 )
                 plt.legend()
                 plt.grid(True)
-                pr_curve_path = os.path.join(save_dir, f"precision_recall_step_{step}.png")
+                pr_curve_path = os.path.join(save_dir, f"precision_recall_step_{i}.png")
                 plt.savefig(pr_curve_path, dpi=300, bbox_inches="tight")
                 plt.close()
 
             print(
-                f"Step={step}, dataset={dataset_idx}, tb={tb}, L_score={L_score.item():.4f}, "
+                f"Step={i}, dataset={ds_idx}, L_score={L_score.item():.4f}, "
                 f"L_flow={L_flow.item():.4f}, L_reg={L_reg:.4f}, "
                 f"Saved figures to {save_dir}"
             )
@@ -576,7 +576,7 @@ def train_and_evaluate_with_holdout(adatas,
         all_pis_list=all_pis_list,
         t=t,
         cond_matrix=conditionals,
-        sigma=0.1,
+        sigma=1.0,
         dt=1.0,
         alpha=0.1,
         reg=1e-6,
@@ -613,7 +613,7 @@ def train_and_evaluate_with_holdout(adatas,
 
 
 def main():
-    T = 5
+    T = 8
     data_loader = DataLoader("../../data/simulation", dataset_type="Synthetic")
     data_loader.load_data()
     adatas, kos, ko_indices, true_matrix = (
@@ -642,13 +642,15 @@ def main():
     ko_idx = [i for i, ko in enumerate(kos) if ko is not None]
     adatas_wt = [adatas[i] for i in wt_idx]
     adatas_ko = [adatas[i] for i in ko_idx]
-    num_variables = 7
-    hidden_dim = 200
-    dims = [num_variables, hidden_dim, 1]
+    n = adatas[0].X.shape[1]
+    dims = [n, 100, 1]
     t = adatas[0].obs["t"].max()
 
-    func_v = models.MLPODEF(dims=dims, GL_reg=0.01, bias=True, knockout_masks=knockout_masks)
-    score_net = MLP(d=num_variables, hidden_sizes=[hidden_dim], time_varying=True, conditional=True, conditional_dim=7)
+    func_v = models.MLPODEF(dims=dims, GL_reg=0.01, bias=True)
+    # score_net = MLP(d=num_variables, hidden_sizes=[hidden_dim], time_varying=True, conditional=True, conditional_dim=7)
+    score_net = fm.MLP(d=n, hidden_sizes = [64, 64], time_varying=True)
+
+    otfms = build_entropic_otfms(adatas, T, sigma= 1.0, dt= 1/T)
 
     # Compute pis for all datasets
     all_pis_list = []
@@ -660,52 +662,127 @@ def main():
     loss_history, flow_model, score_model = train_with_fmot_scorematching(
         func_v=func_v,
         func_s=score_net,
-        adatas_list=adatas_wt,  
-        all_pis_list=all_pis_list,
-        t=t,
+        adatas_list=adatas, 
+        otfms=otfms, 
         cond_matrix=conditionals,
-        sigma=0.1,
-        dt=1.0,
-        alpha=0.05,
-        reg=1e-6,
-        n_steps=100000,
+        alpha=0.1,
+        reg=1e-4,
+        n_steps=4000,
         batch_size=batch_size,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        lr=6e-3,
+        lr=1e-3,
         true_mat = true_matrix
     )
 
-    graph_sm = flow_model.causal_graph() * (1 - np.eye(7))
+    def maskdiag(A):
+        return A * (1 - np.eye(n)) 
 
-    plt.figure(figsize=(8, 6))
-    plt.matshow(graph_sm, cmap="Reds", fignum=False)
-    plt.gca().invert_yaxis()
+    def compute_global_jacobian(v, adatas, dt, device=torch.device("cpu")):
+        """
+        Compute a single adjacency from a big set of states across all datasets.
+        Returns a [d, d] numpy array representing an average Jacobian.
+        """
+
+        all_x_list = []
+        for ds_idx, adata in enumerate(adatas):
+            x0 = adata.X[adata.obs["t"] == 0]
+            all_x_list.append(x0)
+        if len(all_x_list) == 0:
+            return None
+
+        X_all = np.concatenate(all_x_list, axis=0)
+        if X_all.shape[0] == 0:
+            return None
+        
+        X_all_torch = torch.from_numpy(X_all).float().to(device)
+
+        def get_flow(t, x):
+            x_input = x.unsqueeze(0).unsqueeze(0) 
+            t_input = t.unsqueeze(0).unsqueeze(0)  
+            return v(t_input, x_input).squeeze(0).squeeze(0)
+
+        # Or loop over multiple times if the model is time-varying
+        t_val = torch.tensor(0.0).to(device)
+
+        Ju = torch.func.jacrev(get_flow, argnums=1)
+
+        Js = []
+
+        batch_size = 256
+        for start in range(0, X_all_torch.shape[0], batch_size):
+            end = start + batch_size
+            batch_x = X_all_torch[start:end]
+
+            J_local = torch.vmap(lambda x: Ju(t_val, x))(batch_x)
+            J_avg = J_local.mean(dim=0)
+            Js.append(J_avg)
+
+        if len(Js) == 0:
+            return None
+        J_final = torch.stack(Js, dim=0).mean(dim=0)
+
+        A_est = J_final
+
+        return A_est.detach().cpu().numpy().T
+
+    with torch.no_grad():
+        A_estim = compute_global_jacobian(func_v, adatas, dt=1/T, device=torch.device("cpu"))
+
+    W_v = func_v.causal_graph(w_threshold=0.0).T 
+    A_true = true_matrix
+
+
+    # Display both the estimated adjacency matrix and the learned causal graph
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.imshow(maskdiag(A_estim), vmin=-0.5, vmax=0.5, cmap="RdBu_r"); plt.gca().invert_yaxis()
+    plt.title("A_estim (from Jacobian)")
     plt.colorbar()
-    plt.title("Learned graph")
+    plt.subplot(1, 3, 2)
+    plt.imshow(maskdiag(W_v), cmap="Reds"); plt.gca().invert_yaxis()
+    plt.title("Causal Graph (from MLPODEF)")
+    plt.colorbar()
+    plt.subplot(1, 3, 3)
+    plt.imshow(maskdiag(A_true), vmin=-1, vmax=1, cmap="RdBu_r"); plt.gca().invert_yaxis()
+    plt.title("A_true")
+    plt.colorbar()
+    plt.tight_layout()
     plt.show()
 
-    plt.figure(figsize=(8, 6))
-    plt.matshow(true_matrix, cmap="RdBu_r", fignum=False)
-    plt.gca().invert_yaxis()
-    plt.colorbar()
-    plt.title("Learned graph")
-    plt.show()
+    maskdiag(W_v)
 
+    # Compute and display precision-recall curves for both methods
+    from sklearn.metrics import precision_recall_curve, average_precision_score
 
-
-    plt.figure(figsize=(8, 6))
-    y_true = np.abs(np.sign(true_matrix).astype(int).flatten())
-    y_pred = np.abs(graph_sm.flatten())
+    plt.figure(figsize=(12, 5))
+    # For Jacobian-based estimation
+    plt.subplot(1, 2, 1)
+    y_true = np.abs(np.sign(maskdiag(A_true)).astype(int).flatten())
+    y_pred = np.abs(maskdiag(A_estim).flatten())
     prec, rec, thresh = precision_recall_curve(y_true, y_pred)
     avg_prec = average_precision_score(y_true, y_pred)
-    plt.plot(rec, prec, label=f"Flow-based (AP = {avg_prec:.2f})")
+    plt.plot(rec, prec, label=f"Jacobian-based (AP = {avg_prec:.2f})")
     plt.xlabel("Recall")
     plt.ylabel("Precision")
     plt.title(
-        f"Precision-Recall Curve\nAUPR ratio = {avg_prec/np.mean(np.abs(true_matrix) > 0):.2f}"
+        f"Precision-Recall Curve (Jacobian)\nAUPR ratio = {avg_prec/np.mean(np.abs(A_true) > 0)}"
     )
     plt.legend()
     plt.grid(True)
+    # For MLPODEF-based estimation
+    plt.subplot(1, 2, 2)
+    y_pred_mlp = np.abs(maskdiag(W_v).flatten())
+    prec, rec, thresh = precision_recall_curve(y_true, y_pred_mlp)
+    avg_prec_mlp = average_precision_score(y_true, y_pred_mlp)
+    plt.plot(rec, prec, label=f"MLPODEF-based (AP = {avg_prec_mlp:.2f})")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(
+        f"Precision-Recall Curve (MLPODEF)\nAUPR ratio = {avg_prec_mlp/np.mean(np.abs(A_true) > 0)}"
+    )
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
     plt.show()
 
     def evaluate_all_datasets(func, adatas_list, n_samples=100, device="cpu", dataset_idxs=None):
