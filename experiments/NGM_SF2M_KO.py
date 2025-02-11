@@ -24,7 +24,7 @@ from sf2m_utils import SDE, torch_wrapper, wasserstein
 from plot_utils import *
 import fm
 
-T = 8
+T = 5
 class DataLoader:
     def __init__(self, data_path, dataset_type="Synthetic"):
         """
@@ -44,8 +44,8 @@ class DataLoader:
         """Load and preprocess data"""
         if self.dataset_type == "Synthetic":
             paths = glob.glob(
-                os.path.join(self.data_path, "dyn-LI/dyn-LI*-1")
-            ) + glob.glob(os.path.join(self.data_path, "dyn-LI_ko*/dyn-LI*-1"))
+                os.path.join(self.data_path, "dyn-TF/dyn-TF*-1")
+            ) + glob.glob(os.path.join(self.data_path, "dyn-TF_ko*/dyn-TF*-1"))
         elif self.dataset_type == "Curated":
             paths = glob.glob(os.path.join(self.data_path, f"HSC*/HSC*-1"))
         else:
@@ -265,44 +265,38 @@ class MLP(nn.Module):
     def __init__(
         self,
         d=2,
-        hidden_sizes=[100],
+        hidden_sizes=[100,],
         activation=nn.ReLU,
         time_varying=True,
         conditional=False,
-        conditional_dim=0  # Dimension of the conditional input (e.g., KO indicator or embedding)
+        conditional_dim=0  # dimension of the knockout or condition
     ):
         super(MLP, self).__init__()
         self.time_varying = time_varying
         self.conditional = conditional
 
-        # Compute the overall input dimension.
-        # Start with d (the feature dimension).
-        input_dim = d  
-        # If time is used, add 1 (assuming time is a scalar per sample).
+        input_dim = d
         if self.time_varying:
-            input_dim += 1  
-        # If the model is conditional, add the conditional dimension.
+            input_dim += 1
         if self.conditional:
             input_dim += conditional_dim
 
-        # Prepare the list of hidden sizes; the first layer's input size is now input_dim.
         hidden_sizes = copy.copy(hidden_sizes)
-        hidden_sizes.insert(0, input_dim)
-        # The final output is of dimension d (one per variable).
-        hidden_sizes.append(d)
+        hidden_sizes.insert(0, input_dim)  # first layer's input size
+        hidden_sizes.append(d)             # final layer is dimension d
 
-        # Build the network as a sequential model.
-        self.net = nn.Sequential()
+        layers = []
         for i in range(len(hidden_sizes) - 1):
-            self.net.add_module(
-                name=f"L{i}", 
-                module=nn.Linear(hidden_sizes[i], hidden_sizes[i+1])
-            )
-            # Add the activation function for all layers except the output layer.
+            in_size = hidden_sizes[i]
+            out_size = hidden_sizes[i+1]
+            layers.append(nn.Linear(in_size, out_size))
+            # activation except for the last layer
             if i < len(hidden_sizes) - 2:
-                self.net.add_module(name=f"A{i}", module=activation())
-        
-        # Initialize weights and biases.
+                layers.append(activation())
+
+        self.net = nn.Sequential(*layers)
+
+        # Weight init
         for m in self.net.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0, std=0.1)
@@ -314,13 +308,22 @@ class MLP(nn.Module):
             if t.dim() == 1:
                 t = t.unsqueeze(-1)
             inputs.append(t)
+
         if self.conditional:
             if cond is None:
-                raise ValueError("Conditional flag is True, but no conditional input was provided.")
+                raise ValueError("Conditional flag = True, but no 'cond' input provided.")
+            Bx = x.shape[0]
+            if cond.dim() == 1:
+                cond = cond.unsqueeze(0).expand(Bx, -1)
+            elif cond.shape[0] != Bx:
+                raise ValueError(
+                    f"cond batch size ({cond.shape[0]}) != x batch size ({Bx}). "
+                )
             inputs.append(cond)
-        # Concatenate along the feature dimension.
-        inp = torch.cat(inputs, dim=1)
-        return self.net(inp)
+
+        # cat along dim=1 => shape [batch_size, (d + time + cond_dim)]
+        net_in = torch.cat(inputs, dim=1)
+        return self.net(net_in)
 
 
 def train_with_fmot_scorematching(
@@ -364,6 +367,7 @@ def train_with_fmot_scorematching(
     for i in tqdm(range(n_steps)):
         ds_idx = np.random.randint(0, len(adatas_list))
         model = otfms[ds_idx]
+        cond_vector = cond_matrix[ds_idx]
 
         _x, _s, _u, _t, _t_orig = model.sample_bridges_flows(batch_size=batch_size)
         optim.zero_grad()
@@ -373,10 +377,13 @@ def train_with_fmot_scorematching(
         v_input = _x.unsqueeze(1)
         t_input = _t.unsqueeze(1)
 
+        B = _x.shape[0]
+        cond_expanded = cond_vector.repeat(B // 164 + 1, 1)[:B]
+
         # Get model outputs and reshape
-        s_fit = func_s(_t, _x).squeeze(1)
+        s_fit = func_s(_t, _x, cond_expanded).squeeze(1)
         # v_fit = v(t_input, v_input).squeeze(1)
-        v_fit = func_v(t_input, v_input).squeeze(1) - model.sigma**2/2 * func_s(_t, _x)
+        v_fit = func_v(t_input, v_input, ds_idx).squeeze(1) - model.sigma**2/2 * func_s(_t, _x, cond_expanded)
 
         L_score = torch.mean((_t_orig * (1 - _t_orig)) * (s_fit - _s) ** 2)
         L_flow = torch.mean((v_fit * model.dt - _u) ** 2)
@@ -613,7 +620,7 @@ def train_and_evaluate_with_holdout(adatas,
 
 
 def main():
-    T = 8
+    T = 5
     data_loader = DataLoader("../../data/simulation", dataset_type="Synthetic")
     data_loader.load_data()
     adatas, kos, ko_indices, true_matrix = (
@@ -623,11 +630,12 @@ def main():
         data_loader.true_matrix.values,
     )
     batch_size = 164
+    n = adatas[0].X.shape[1]
 
     # want to create a [8, n, 8] matrix that is one hot encoded and will be selected depending on dataset idx
     conditionals = []
     for i, ad in enumerate(kos):
-        cond_matrix = torch.zeros(batch_size, 7)
+        cond_matrix = torch.zeros(batch_size, n)
         if ad is not None:
             cond_matrix[:,i] = 1
         conditionals.append(cond_matrix)
@@ -642,22 +650,15 @@ def main():
     ko_idx = [i for i, ko in enumerate(kos) if ko is not None]
     adatas_wt = [adatas[i] for i in wt_idx]
     adatas_ko = [adatas[i] for i in ko_idx]
-    n = adatas[0].X.shape[1]
     dims = [n, 100, 1]
     t = adatas[0].obs["t"].max()
 
-    func_v = models.MLPODEF(dims=dims, GL_reg=0.01, bias=True)
-    # score_net = MLP(d=num_variables, hidden_sizes=[hidden_dim], time_varying=True, conditional=True, conditional_dim=7)
-    score_net = fm.MLP(d=n, hidden_sizes = [64, 64], time_varying=True)
+    #func_v = models.MLPODEF(dims=dims, GL_reg=0.01, bias=True)
+    func_v = models.MLPODEF1(dims=dims, GL_reg=0.04, bias=True, knockout_masks=knockout_masks)
+    score_net = MLP(d=n, hidden_sizes=[100,100], time_varying=True, conditional=True, conditional_dim=n)
+    # score_net = fm.MLP(d=n, hidden_sizes = [64, 64], time_varying=True)
 
     otfms = build_entropic_otfms(adatas, T, sigma= 1.0, dt= 1/T)
-
-    # Compute pis for all datasets
-    all_pis_list = []
-    for i, ad in enumerate(zip(adatas, ko_indices)):
-        T_local = ad[0].obs["t"].max()
-        pi_list = compute_all_pis_fixed(ad[0], T_local, reg=1e-1, ko_index=ad[1])
-        all_pis_list.append(pi_list)
 
     loss_history, flow_model, score_model = train_with_fmot_scorematching(
         func_v=func_v,
@@ -666,11 +667,11 @@ def main():
         otfms=otfms, 
         cond_matrix=conditionals,
         alpha=0.1,
-        reg=1e-4,
-        n_steps=4000,
+        reg=5e-6,
+        n_steps=15000,
         batch_size=batch_size,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        lr=1e-3,
+        lr=3e-3,
         true_mat = true_matrix
     )
 
